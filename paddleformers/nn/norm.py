@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import paddle
 import paddle.nn as nn
 from paddle.distributed.fleet.utils.sequence_parallel_utils import (
@@ -67,6 +69,14 @@ class RMSNorm(nn.Layer):
             self.enable_sequence_parallel()
 
     def forward(self, hidden_states):
+        # DIAGNOSTIC env-gated capture (E-051R). Observer only: default off, no-op unless
+        # MODEL_REPRO_RMSNORM_ARCHIVE_DIR is set. Never alters hidden_states, the layer,
+        # or the value returned below.
+        if os.environ.get("MODEL_REPRO_RMSNORM_ARCHIVE_DIR"):
+            from paddle_rmsnorm_capture_hook import maybe_capture as _repro_maybe_capture
+
+            _repro_maybe_capture(self, hidden_states)
+
         current_device = detect_device()
         if self.config.get("fuse_rms_norm", True) and current_device != "iluvatar_gpu":
             return fused_rms_norm_ext(hidden_states, self.weight, self.variance_epsilon)[0].astype(self.weight.dtype)

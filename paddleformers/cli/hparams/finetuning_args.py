@@ -328,6 +328,17 @@ class FinetuningArguments(
         metadata={"help": ("Whether to enable accuracy alignment with the Megatron framework.")},
     )
 
+    moe_expert_fusion: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to fuse MoE experts into grouped GEMM (PaddleFleet "
+                "GroupedMLPExpert, i.e. the `_forward_single_card_grouped_gemm_moe` "
+                "branch). When None, the model config value is kept."
+            )
+        },
+    )
+
     def __post_init__(self):
         if (
             self.internal_medicine_monitors

@@ -16,6 +16,11 @@ import os
 import shutil
 import sys
 
+import paddle
+
+from paddleformers.cli.export.export import run_export
+from paddleformers.cli.train.tuner import run_tuner
+
 BIND_TRAINER_NUMA_EXECED = "BIND_TRAINER_NUMA_EXECED"
 
 
@@ -80,17 +85,19 @@ def launch():
     else:
         raise ValueError("len(sys.argv) mush be larger than 1")
 
-    if command == "train":
-        _maybe_bind_trainer_numa()
-        from paddleformers.cli.train.tuner import run_tuner
-
-        run_tuner()
-    elif command == "export":
-        from paddleformers.cli.export.export import run_export
-
-        run_export()
-    else:
-        raise ValueError(f"Unknown command : {command}")
+    try:
+        if command == "train":
+            _maybe_bind_trainer_numa()
+            run_tuner()
+        elif command == "export":
+            run_export()
+        else:
+            raise ValueError(f"Unknown command : {command}")
+    finally:
+        # The distributed launcher otherwise tears down NCCL during interpreter
+        # finalization, which can abort after a successful checkpoint save.
+        if paddle.distributed.is_initialized():
+            paddle.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
