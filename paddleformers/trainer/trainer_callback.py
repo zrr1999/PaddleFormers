@@ -841,6 +841,56 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
         update = update.astype(paddle.float32)
         update_list = list(update)
 
+        _dump_dir = os.environ.get("MODEL_REPRO_EXPERT_BIAS_DUMP_DIR")
+        if _dump_dir:
+            import hashlib as _hashlib
+
+            _rank = dist.get_rank() if dist.is_initialized() else 0
+            _step = int(getattr(state, "global_step", 0)) + 1
+            os.makedirs(_dump_dir, exist_ok=True)
+            _before = []
+            for _i, (_b, _u) in enumerate(zip(biases, usages)):
+                _bb = _b.detach().astype("float32").cpu().numpy()
+                _uu = _u.detach().astype("float32").cpu().numpy()
+                _before.append(
+                    {
+                        "index": _i,
+                        "bias_shape": list(_bb.shape),
+                        "bias_sha16": _hashlib.sha256(_bb.tobytes()).hexdigest()[:16],
+                        "bias": _bb.reshape(-1).tolist(),
+                        "usage_shape": list(_uu.shape),
+                        "usage": _uu.reshape(-1).tolist(),
+                    }
+                )
+            _upd = update.detach().astype("float32").cpu().numpy()
+            _payload = {
+                "schema": "glm52-expert-bias-dump/v1",
+                "framework": "paddle",
+                "phase": "before_add",
+                "rank": _rank,
+                "step": _step,
+                "update_lr": float(self.update_lr),
+                "use_mp": bool(self.use_mp),
+                "mp_nranks": int(mp_group.nranks) if mp_group is not None else 1,
+                "dp_nranks": int(dp_group.nranks) if dp_group is not None else 1,
+                "sd_nranks": int(sd_group.nranks) if sd_group is not None else 1,
+                "usages_mean": usages_mean.detach().astype("float32").cpu().numpy().reshape(-1).tolist(),
+                "update": _upd.reshape(_upd.shape[0], -1).tolist(),
+                "layers": _before,
+            }
+            with open(
+                os.path.join(_dump_dir, f"rank{_rank}_step{_step}_before.json"),
+                "w",
+                encoding="utf-8",
+            ) as _fh:
+                json.dump(_payload, _fh, indent=2)
+                _fh.write("\n")
+            print(
+                f"[EXPERT-BIAS-DUMP] paddle before rank={_rank} step={_step} "
+                f"nlayers={len(_before)} lr={self.update_lr} use_mp={self.use_mp}",
+                flush=True,
+            )
+
         # print('on_optimizer_end bias:', [bias.tolist() for bias in biases])
         # print('on_optimizer_end usage:', usages_tensor.tolist())
         # print('on_optimizer_end update:', update.tolist())
@@ -861,7 +911,42 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
                         bias.add_(upd)
                     usages.pop(0).zero_()
 
+        _bias_refs = list(biases) if _dump_dir else None
         model.apply(update_bias)
+
+        if _dump_dir:
+            _after = []
+            for _i, _b in enumerate(_bias_refs):
+                _bb = _b.detach().astype("float32").cpu().numpy()
+                _after.append(
+                    {
+                        "index": _i,
+                        "bias_sha16": _hashlib.sha256(_bb.tobytes()).hexdigest()[:16],
+                        "bias": _bb.reshape(-1).tolist(),
+                    }
+                )
+            with open(
+                os.path.join(_dump_dir, f"rank{_rank}_step{_step}_after.json"),
+                "w",
+                encoding="utf-8",
+            ) as _fh:
+                json.dump(
+                    {
+                        "schema": "glm52-expert-bias-dump/v1",
+                        "framework": "paddle",
+                        "phase": "after_add",
+                        "rank": _rank,
+                        "step": _step,
+                        "layers": _after,
+                    },
+                    _fh,
+                    indent=2,
+                )
+                _fh.write("\n")
+            print(
+                f"[EXPERT-BIAS-DUMP] paddle after rank={_rank} step={_step}",
+                flush=True,
+            )
 
 
 class MoEQuantileBalancingCallback(TrainerCallback):

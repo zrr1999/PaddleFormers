@@ -2921,10 +2921,16 @@ class TrainingArguments:
                 self.expert_tensor_model_parallel_size = -1
 
         # NOTE(Waynezee): when moe_expert_fusion is true and sharding_parallel_size = 1,  checkpoint will fail to save
-        if hasattr(self, "moe_expert_fusion") and self.moe_expert_fusion and self.world_size > 1:
+        # E-193: live Explore path uses save_strategy=no; skip the assert then (same as PaddleFormers-e466).
+        if (
+            hasattr(self, "moe_expert_fusion")
+            and self.moe_expert_fusion
+            and self.world_size > 1
+            and getattr(self.save_strategy, "value", self.save_strategy) != "no"
+        ):
             assert (
                 self.sharding_parallel_size > 1
-            ), "Checkpoint will fail to save when moe_expert_fusion is true and sharding_parallel_size = 1, please set moe_expert_fusion to false"
+            ), "Checkpoint will fail to save when moe_expert_fusion is true and sharding_parallel_size = 1, please set moe_expert_fusion to false or sharding_parallel_size > 1"
 
         if self.hybrid_parallel_topo_order is None:
             self.hybrid_parallel_topo_order = "sharding_first"
