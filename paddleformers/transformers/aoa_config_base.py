@@ -69,6 +69,10 @@ class MoEAOAConfigParams:
     # Extra statements to add
     extra_statements: List[str] = field(default_factory=list)
 
+    # Last-stage MTP embedding copy (magic-send, or UAC re-lookup).
+    enable_mtp_magic_send: bool = False
+    use_accuracy_compatible: bool = False
+
 
 class MoEAOAConfigGenerator:
     """Base class for MoE AOA config generation.
@@ -134,6 +138,8 @@ class MoEAOAConfigGenerator:
             model_prefix=cls._get_model_prefix(config),
             index_n_heads=getattr(config, "index_n_heads", 0),
             indexer_types=getattr(config, "indexer_types", None),
+            enable_mtp_magic_send=getattr(config, "enable_mtp_magic_send", False),
+            use_accuracy_compatible=getattr(config, "use_accuracy_compatible", False),
         )
 
     @classmethod
@@ -184,6 +190,22 @@ class MoEAOAConfigGenerator:
 
         # Embeddings
         statements.append(f"model.embed_tokens.weight -> {params.model_prefix}embedding.embed_tokens.weight")
+        if (
+            params.num_nextn_predict_layers > 0
+            and (params.enable_mtp_magic_send or params.use_accuracy_compatible)
+        ):
+            # Last-stage MTP VocabParallelEmbedding is a copy of the official
+            # table (torch mtp_process). Without this, load fail-closes on
+            # model.layers.{N}.mtp_embed.weight (E-341).
+            for mtp_i in range(params.num_nextn_predict_layers):
+                mtp_embed_idx = (
+                    params.num_hidden_layers
+                    + params.num_head_empty_layers
+                    + mtp_i
+                )
+                statements.append(
+                    f"model.embed_tokens.weight -> {params.model_prefix}layers.{mtp_embed_idx}.mtp_embed.weight"
+                )
 
         # lm_head
         if params.tie_word_embeddings:
@@ -594,6 +616,20 @@ class MoEAOAConfigGenerator:
             statements.append(f"{params.model_prefix}lm_head.weight -> _")
         else:
             statements.append(f"{params.model_prefix}lm_head.weight -> lm_head.weight")
+
+        if (
+            params.num_nextn_predict_layers > 0
+            and (params.enable_mtp_magic_send or params.use_accuracy_compatible)
+        ):
+            for mtp_i in range(params.num_nextn_predict_layers):
+                mtp_embed_idx = (
+                    params.num_hidden_layers
+                    + params.num_head_empty_layers
+                    + mtp_i
+                )
+                statements.append(
+                    f"{params.model_prefix}layers.{mtp_embed_idx}.mtp_embed.weight -> _"
+                )
 
         return statements
 

@@ -2907,6 +2907,34 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                     "the model must implement the _gen_aoa_config function to provide checkpoint conversion rules."
                 )
             aoa_config = cls._gen_aoa_config(config)
+            if os.environ.get("MODEL_REPRO_AOA_DEBUG", "0") != "0":
+                _aoa_stmts = aoa_config.get("aoa_statements", [])
+                _idx = [s for s in _aoa_stmts if "indexer" in s]
+                _grp = [s for s in _aoa_stmts if "grouped_gemm_experts" in s]
+                print(
+                    f"[AOA-DEBUG] total={len(_aoa_stmts)} indexer={len(_idx)} "
+                    f"grouped={len(_grp)} moe_expert_fusion={getattr(config, 'moe_expert_fusion', None)} "
+                    f"multi_latent_attention={getattr(config, 'multi_latent_attention', None)}",
+                    flush=True,
+                )
+                try:
+                    import paddlefleet.transformer.dsa_attention as _da
+
+                    print(f"[AOA-DEBUG] dsa_attention file: {_da.__file__}", flush=True)
+                except Exception as _e:
+                    print(f"[AOA-DEBUG] dsa import err: {_e}", flush=True)
+                for _s in _idx[:8]:
+                    print("   [AOA-IDX]", _s, flush=True)
+                if os.environ.get("MODEL_REPRO_AOA_DEBUG", "0") == "2":
+                    _model_idx = [
+                        k for k in model.state_dict().keys() if "indexer" in k
+                    ]
+                    print(
+                        f"[AOA-DEBUG] model indexer keys ({len(_model_idx)}):",
+                        flush=True,
+                    )
+                    for _k in sorted(_model_idx):
+                        print("   ", _k, flush=True)
             sharded_state_dict = model.sharded_state_dict()
             metadata_path = os.path.join(ckpt_path, FLEX_CKPT_AUTO_GENERATED_METADATA)
 

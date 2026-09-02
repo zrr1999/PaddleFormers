@@ -15,12 +15,17 @@
 """Training Ernie Model."""
 
 import gc
+import hashlib
+import importlib.metadata
+import json
 import math
 import os
+import platform
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import paddle
@@ -47,6 +52,7 @@ from paddleformers.trainer import (
     MoEGateSpGradSyncCallBack,
     MoEQuantileBalancingCallback,
     RuntimeTimer,
+    TrainerCallback,
     get_last_checkpoint,
     set_random_seed,
     set_seed,
@@ -71,6 +77,1156 @@ from paddleformers.utils.log import logger
 from .make_data_utils import DataGenerator
 from .sft_trainer import SFTTrainer
 
+
+def project_owning_loader_semantics(input_values, model_label_values, position_values=None):
+    """Normalize padded Paddle carrier tensors back to the dataset semantic row."""
+    if position_values:
+        semantic_length = max(int(position) for position in position_values) + 1
+    else:
+        semantic_length = len(input_values)
+    if semantic_length <= 0 or semantic_length > len(input_values) or semantic_length > len(model_label_values):
+        raise ValueError(
+            f"invalid owning-loader semantic length {semantic_length} for carrier lengths "
+            f"{len(input_values)}/{len(model_label_values)}"
+        )
+    semantic_input_values = input_values[:semantic_length]
+    semantic_model_label_values = model_label_values[:semantic_length]
+    # BaseSFTDataset rolls causal-LM labels left by one before collation. Reverse
+    # that roll so both framework receipts describe the same dataset row.
+    semantic_label_values = semantic_model_label_values[-1:] + semantic_model_label_values[:-1]
+    semantic_mask_values = [label != -100 for label in semantic_label_values]
+    return semantic_input_values, semantic_label_values, semantic_mask_values
+
+
+# E-237: canonical names for the MTP transformer layer's internal boundaries.
+# The two frameworks name these submodules differently, so the map is what makes
+# the comparison a by-name pairing instead of a by-order guess:
+#   paddle 6.transformer_layer.*          torch mtp.layers.0.mtp_model_layer.*
+#   input_layernorm                   <-> input_layernorm
+#   self_attn                         <-> self_attention
+#   self_attn.o_proj                  <-> self_attention.linear_proj
+#   post_attention_layernorm          <-> pre_mlp_layernorm
+#   mlp                               <-> mlp
+#   mlp.gate                          <-> mlp.router
+#   mlp.shared_experts                <-> mlp.shared_experts
+_MTP_LAYER_INTERNAL_BOUNDARIES = {
+    "6.transformer_layer.input_layernorm": "mtplayer_input_layernorm_output",
+    "6.transformer_layer.self_attn": "mtplayer_self_attention_output",
+    "6.transformer_layer.self_attn.o_proj": "mtplayer_out_proj_output",
+    "6.transformer_layer.post_attention_layernorm": "mtplayer_post_attn_norm_output",
+    "6.transformer_layer.mlp": "mtplayer_mlp_output",
+    "6.transformer_layer.mlp.gate": "mtplayer_gate_output",
+    "6.transformer_layer.mlp.shared_experts": "mtplayer_shared_experts_output",
+    # E-238: split the MoE backward into its two branches. The MLP's OUTPUT
+    # gradient is bit-equal while its INPUT gradient is not (E-237), so the
+    # divergence is inside this module: either the routed-expert
+    # dispatch/GEMM/combine backward or the shared-expert backward.
+    "6.transformer_layer.mlp.grouped_gemm_experts": "mtplayer_routed_experts_output",
+    # E-239: inside the shared expert. E-238 localized a divergence to a module
+    # whose INPUT, OUTPUT and OUTPUT GRADIENT are all bit-equal while its INPUT
+    # GRADIENT is not - a two-linear SwiGLU MLP, the smallest boundary reached so
+    # far. These two split its backward into the down-projection dgrad, the
+    # activation backward, and the up/gate dgrad.
+    "6.transformer_layer.mlp.shared_experts.up_gate_proj": "mtpshared_fc1_output",
+    "6.transformer_layer.mlp.shared_experts.down_proj": "mtpshared_fc2_output",
+}
+
+
+_MTP_LAYER_INTERNAL_BRANCH_INPUTS = {
+    "6.transformer_layer.mlp.grouped_gemm_experts": "mtplayer_routed_experts_input",
+    "6.transformer_layer.mlp.shared_experts": "mtplayer_shared_experts_input",
+    # E-239: down_proj's INPUT is the activation output, which is nobody's module
+    # output, so its gradient is only reachable through a pre-hook. It is the
+    # boundary that separates the down-projection dgrad from the activation
+    # backward.
+    "6.transformer_layer.mlp.shared_experts.down_proj": "mtpshared_fc2_input",
+    # E-259: ThreePath third clone is the router-path hidden (gate input).
+    "6.transformer_layer.mlp.gate": "mtplayer_router_hidden_input",
+}
+
+
+class ModelReproObservationCallback(TrainerCallback):
+    """Opt-in rank-zero artifacts for formal model-reproduction runs."""
+
+    _LAYER0_FINE_FORWARD_MODULES = {
+        "1.input_layernorm": "layer0_input_rmsnorm_output",
+        "1.self_attn.q_a_proj": "layer0_q_down_projection_output",
+        "1.self_attn.q_a_layernorm": "layer0_q_rmsnorm_output",
+        "1.self_attn.q_b_proj": "layer0_q_up_projection_output",
+        "1.self_attn.kv_a_proj_with_mqa": "layer0_kv_down_projection_output",
+        "1.self_attn.kv_a_layernorm": "layer0_kv_rmsnorm_output",
+        "1.self_attn.kv_b_proj": "layer0_kv_up_projection_output",
+        "1.self_attn.o_proj": "layer0_attention_output_projection",
+        "1.self_attn": "layer0_self_attention_output",
+        "1.mlp.up_gate_proj": "layer0_dense_fc1_output",
+        "1.mlp.down_proj": "layer0_dense_fc2_output",
+        "1.mlp": "layer0_dense_mlp_output",
+        "1": "base_transformer_layer_0_output",
+    }
+
+    # E-093: dynamic all-layers fine spec (4 layers, PP2-aware) built per rank.
+    # Each PP stage exposes two decoder blocks named "1" and "2"; stage 0
+    # (rank<2) maps them to global layers 0..1, stage 1 (rank>=2) to 2..3.
+    _ALL_LAYERS_FINE_MODULE_SUFFIXES = {
+        "input_layernorm": "input_rmsnorm_output",
+        "self_attn.q_a_proj": "q_down_projection_output",
+        "self_attn.q_a_layernorm": "q_rmsnorm_output",
+        "self_attn.q_b_proj": "q_up_projection_output",
+        "self_attn.kv_a_proj_with_mqa": "kv_down_projection_output",
+        "self_attn.kv_a_layernorm": "kv_rmsnorm_output",
+        "self_attn.kv_b_proj": "kv_up_projection_output",
+        "self_attn.o_proj": "attention_output_projection",
+        "self_attn": "self_attention_output",
+        "mlp.up_gate_proj": "dense_fc1_output",
+        "mlp.down_proj": "dense_fc2_output",
+        "mlp": "dense_mlp_output",
+        "": "base_transformer_layer_output",
+    }
+
+    @classmethod
+    def _all_layers_fine_specs(cls):
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        # PaddleFormers names the pipeline sublayers by their GLOBAL position
+        # ("0.embedding", then "1".."4" for the four decoder blocks), and each PP
+        # stage only instantiates its own subset. Stage 0 (rank<2) therefore holds
+        # "1"/"2" (global layers 0/1) and stage 1 (rank>=2) holds "3"/"4" (2/3).
+        if rank < 2:
+            local_layers = (("1", 0), ("2", 1))
+        else:
+            local_layers = (("3", 2), ("4", 3))
+        specs = {}
+        for local_name, global_layer in local_layers:
+            for suffix, boundary_suffix in cls._ALL_LAYERS_FINE_MODULE_SUFFIXES.items():
+                module_name = local_name if not suffix else f"{local_name}.{suffix}"
+                specs[module_name] = f"layer{global_layer}_{boundary_suffix}"
+        return specs
+
+    @classmethod
+    def _layer3_moe_fine_specs(cls):
+        """E-095: MoE-internal boundaries for global layer 3 (module "4" on stage 1).
+
+        Selectors that do not match exactly once are skipped, so the emitted
+        metadata "selectors" list documents which module names actually exist.
+        """
+        specs = {
+            "4.post_attention_layernorm": "layer3_pre_mlp_rmsnorm_output",
+            "4.mlp": "layer3_moe_mlp_output",
+            "4.mlp.gate": "layer3_router_output",
+            "4.mlp.experts": "layer3_experts_output",
+            "4.mlp.grouped_gemm_experts": "layer3_grouped_experts_output",
+            "4.mlp.router": "layer3_router_output_alt",
+            "4.mlp.shared_experts": "layer3_shared_expert_output",
+            "4.mlp.shared_experts.up_gate_proj": "layer3_shared_expert_fc1_output",
+            "4.mlp.shared_experts.down_proj": "layer3_shared_expert_fc2_output",
+        }
+        for expert in range(16):
+            specs[f"4.mlp.experts.{expert}"] = f"layer3_expert{expert}_output"
+            specs[f"4.mlp.experts.{expert}.up_gate_proj"] = f"layer3_expert{expert}_fc1_output"
+            specs[f"4.mlp.experts.{expert}.down_proj"] = f"layer3_expert{expert}_fc2_output"
+        return specs
+
+    @classmethod
+    def _forward_contract_specs(cls, boundary_set):
+        if boundary_set == "coarse":
+            return None
+        if boundary_set == "layer0_fine":
+            return dict(cls._LAYER0_FINE_FORWARD_MODULES)
+        if boundary_set == "all_layers_fine":
+            return cls._all_layers_fine_specs()
+        if boundary_set == "layer3_moe_fine":
+            return cls._layer3_moe_fine_specs()
+        raise ValueError(f"unsupported MODEL_REPRO_FORWARD_BOUNDARY_SET: {boundary_set}")
+
+    def __init__(self, raw_loss_path=None, input_receipt_path=None, parameter_receipt_dir=None):
+        self.raw_loss_path = raw_loss_path
+        self.input_receipt_path = input_receipt_path
+        self.parameter_receipt_dir = parameter_receipt_dir
+        self.env_path = os.environ.get("MODEL_REPRO_ENV_PATH")
+        self.loss_path = os.environ.get("MODEL_REPRO_LOSS_PATH")
+        self._loss_events = []
+        self._input_written = False
+        self._parameters_written = False
+        self._last_model = None
+        # UAC gate copy-back: fp32 master clones keyed by name. Restore
+        # into the live Parameter before AdamW, copy rounded bf16 view
+        # after. Not a Parameter, so autograd identity stays.
+        self._uac_gate_master = {}
+
+    @staticmethod
+    def _sha256_file(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    @staticmethod
+    def _write_json(path, payload):
+        path = Path(path).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _normalized_device():
+        """Return the device class the benchmark checker expects, not the GPU model name."""
+        return "cuda" if paddle.device.is_compiled_with_cuda() else "cpu"
+
+    @staticmethod
+    def _normalized_dtype(args):
+        return "bfloat16" if getattr(args, "bf16", False) else "float32"
+
+    @staticmethod
+    def _machine_loss_payload(events, raw_path=None, source_sha256=None):
+        """Return the machine loss artifact.
+
+        ``losses`` is the benchmark gate field: an unrounded main-loss series with
+        one entry per recorded step. ``events`` keeps per-step diagnostic detail.
+        """
+        return {
+            "schema": "glm52-machine-loss/v1",
+            "framework": "paddle",
+            "raw": True,
+            "owning_cli_exit_code": 0,
+            "losses": [event["loss"] for event in events if "loss" in event],
+            "event_count": len(events),
+            "steps": [event["step"] for event in events],
+            "events": events,
+            "source": str(raw_path) if raw_path else None,
+            "source_sha256": source_sha256,
+        }
+
+    @classmethod
+    def _environment_payload(cls, args):
+        config_path = os.environ.get("MODEL_REPRO_MODEL_CONFIG_PATH")
+        return {
+            "schema": "glm52-environment/v1",
+            "framework": "paddle",
+            "framework_version": paddle.__version__,
+            "python_version": platform.python_version(),
+            "device": cls._normalized_device(),
+            "device_name": paddle.device.cuda.get_device_name(0),
+            "dtype": cls._normalized_dtype(args),
+            "cuda": paddle.version.cuda(),
+            "cudnn": paddle.version.cudnn(),
+            "nccl_package": importlib.metadata.version("nvidia-nccl-cu12"),
+            "model_id": os.environ.get("MODEL_REPRO_MODEL_ID"),
+            "revision": os.environ.get("MODEL_REPRO_MODEL_REVISION"),
+            "model_config_sha256": cls._sha256_file(config_path) if config_path else None,
+            "weights_loaded": True,
+            "world_size": paddle.distributed.get_world_size()
+            if paddle.distributed.is_initialized()
+            else 1,
+        }
+
+    @staticmethod
+    def _is_writer(state):
+        return bool(getattr(state, "is_world_process_zero", False))
+
+    @staticmethod
+    def _values(tensor):
+        if hasattr(tensor, "is_dist") and tensor.is_dist():
+            tensor = tensor._local_value()
+        return tensor.detach().cast("int64").reshape([-1]).numpy().tolist()
+
+    @staticmethod
+    def _digest(values):
+        return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _parameter_record(param):
+        if hasattr(param, "is_dist") and param.is_dist():
+            param = param._local_value()
+        tensor = param.detach().contiguous().cpu()
+        array = np.ascontiguousarray(tensor.numpy())
+        dtype = str(tensor.dtype)
+        positive_zero_count = 0
+        negative_zero_count = 0
+        bit_dtypes = {
+            "paddle.bfloat16": np.uint16,
+            "paddle.float16": np.uint16,
+            "paddle.float32": np.uint32,
+            "paddle.float64": np.uint64,
+        }
+        bit_dtype = bit_dtypes.get(dtype)
+        if bit_dtype is not None:
+            bits = array.view(bit_dtype)
+            sign_bit = np.array(1 << (np.dtype(bit_dtype).itemsize * 8 - 1), dtype=bit_dtype)
+            positive_zero_count = int(np.count_nonzero(bits == 0))
+            negative_zero_count = int(np.count_nonzero(bits == sign_bit))
+        record = {
+            "shape": list(tensor.shape),
+            "dtype": dtype,
+            "numel": int(tensor.numel()),
+            "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+            "positive_zero_count": positive_zero_count,
+            "negative_zero_count": negative_zero_count,
+        }
+        if tensor.ndim == 2:
+            record["transpose_sha256"] = hashlib.sha256(np.ascontiguousarray(array.T).tobytes()).hexdigest()
+        # Grouped expert weights are [E, in, out] or [E, out, in]. Per-slice
+        # sha + last-two-dims transpose lets us bitwise-compare against
+        # SequentialMLP local_experts[e] without dumping the 1.6 GB tensor.
+        if tensor.ndim == 3:
+            slices = []
+            for i in range(array.shape[0]):
+                sl = np.ascontiguousarray(array[i])
+                slT = np.ascontiguousarray(array[i].T)
+                slices.append(
+                    {
+                        "index": i,
+                        "sha256": hashlib.sha256(sl.tobytes()).hexdigest(),
+                        "transpose_sha256": hashlib.sha256(slT.tobytes()).hexdigest(),
+                    }
+                )
+            record["slice_sha256"] = slices
+        return record
+
+    @staticmethod
+    def _first_tensor(value):
+        if isinstance(value, paddle.Tensor):
+            return value
+        if isinstance(value, dict):
+            for item in value.values():
+                tensor = ModelReproObservationCallback._first_tensor(item)
+                if tensor is not None:
+                    return tensor
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                tensor = ModelReproObservationCallback._first_tensor(item)
+                if tensor is not None:
+                    return tensor
+        return None
+
+    def _write_forward_record(self, boundary, value):
+        tensor = self._first_tensor(value)
+        if tensor is None:
+            return
+        if hasattr(tensor, "is_dist") and tensor.is_dist():
+            tensor = tensor._local_value()
+        output_dir = os.environ.get("MODEL_REPRO_FORWARD_RECEIPT_DIR")
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        rank_dir = os.path.join(output_dir, f"rank{rank}")
+        os.makedirs(rank_dir, exist_ok=True)
+        records = getattr(self, "_forward_contract_records", {})
+        call_index = sum(name == boundary or name.startswith(f"{boundary}_call") for name in records)
+        name = boundary if call_index == 0 else f"{boundary}_call{call_index}"
+        tensor = tensor.detach().contiguous().cpu()
+        array = np.ascontiguousarray(tensor.numpy())
+        raw = array.tobytes()
+        file_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in name)
+        _step_tag = os.environ.get("TRAINER_GLOBAL_STEP", "x")
+        raw_path = os.path.join(rank_dir, f"{file_name}_s{_step_tag}.bin")
+        with open(raw_path, "wb") as stream:
+            stream.write(raw)
+        dtype = str(tensor.dtype)
+        positive_zero_count = 0
+        negative_zero_count = 0
+        bit_dtypes = {
+            "paddle.bfloat16": np.uint16,
+            "paddle.float16": np.uint16,
+            "paddle.float32": np.uint32,
+            "paddle.float64": np.uint64,
+        }
+        bit_dtype = bit_dtypes.get(dtype)
+        if bit_dtype is not None:
+            bits = array.view(bit_dtype)
+            sign_bit = np.array(1 << (np.dtype(bit_dtype).itemsize * 8 - 1), dtype=bit_dtype)
+            positive_zero_count = int(np.count_nonzero(bits == 0))
+            negative_zero_count = int(np.count_nonzero(bits == sign_bit))
+        records[name] = {
+            "boundary": boundary,
+            "shape": list(tensor.shape),
+            "dtype": dtype,
+            "numel": int(tensor.numel()),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "positive_zero_count": positive_zero_count,
+            "negative_zero_count": negative_zero_count,
+            "raw_path": raw_path,
+        }
+        self._forward_contract_records = records
+        self._install_backward_record(name, self._first_tensor(value))
+        payload = {
+            "schema": "glm52-local-forward-boundaries/v1",
+            "framework": "paddle",
+            "rank": rank,
+            "world_size": paddle.distributed.get_world_size() if paddle.distributed.is_initialized() else 1,
+            "boundary_set": getattr(self, "_forward_contract_boundary_set", "coarse"),
+            "selectors": getattr(self, "_forward_contract_selector_receipt", []),
+            "records": records,
+        }
+        with open(os.path.join(rank_dir, "metadata.json"), "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+
+    def _install_backward_record(self, name, tensor):
+        """Capture d(loss)/d(boundary output) for an already-recorded boundary.
+
+        Forward boundaries are bit-exact through the dense stack while dense
+        weight gradients still disagree well above bf16 rounding, so the
+        divergence enters during backward. Hooking the very tensor the forward
+        receipt stored keeps both receipts on one boundary definition.
+        """
+        output_dir = os.environ.get("MODEL_REPRO_BACKWARD_RECEIPT_DIR")
+        if not output_dir or tensor is None or tensor.stop_gradient:
+            return
+        tensor.register_hook(lambda grad, name=name: self._write_backward_record(name, grad))
+
+    def _write_backward_record(self, name, grad):
+        output_dir = os.environ.get("MODEL_REPRO_BACKWARD_RECEIPT_DIR")
+        if not output_dir or grad is None:
+            return
+        if hasattr(grad, "is_dist") and grad.is_dist():
+            grad = grad._local_value()
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        rank_dir = os.path.join(output_dir, f"rank{rank}")
+        os.makedirs(rank_dir, exist_ok=True)
+        records = getattr(self, "_backward_contract_records", {})
+        # A boundary tensor can receive several gradient contributions; number
+        # them so a differing accumulation order stays visible instead of being
+        # overwritten by the last writer.
+        call_index = sum(key == name or key.startswith(f"{name}_bwd") for key in records)
+        key = name if call_index == 0 else f"{name}_bwd{call_index}"
+        grad = grad.detach().contiguous().cpu()
+        array = np.ascontiguousarray(grad.numpy())
+        raw = array.tobytes()
+        file_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in key)
+        _step_tag = os.environ.get("TRAINER_GLOBAL_STEP", "x")
+        raw_path = os.path.join(rank_dir, f"{file_name}_s{_step_tag}.bin")
+        with open(raw_path, "wb") as stream:
+            stream.write(raw)
+        records[key] = {
+            "boundary": name,
+            "shape": list(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": int(grad.numel()),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_path": raw_path,
+        }
+        self._backward_contract_records = records
+        payload = {
+            "schema": "glm52-local-backward-boundaries/v1",
+            "framework": "paddle",
+            "rank": rank,
+            "world_size": paddle.distributed.get_world_size() if paddle.distributed.is_initialized() else 1,
+            "boundary_set": getattr(self, "_forward_contract_boundary_set", "coarse"),
+            "records": records,
+        }
+        with open(os.path.join(rank_dir, "metadata.json"), "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+
+    def _dump_constructed_config(self, model, rank):
+        """E-252: serialise the config actually used to build the layers.
+
+        The bias_activation_fusion asymmetry that produced the dense shared-expert
+        backward residual was hardcoded in GLMMoEModelProvider, absent from both task
+        YAMLs, and found only because an instrumentation dump on the other side stayed
+        silent. A field-by-field diff of the two frameworks' CONSTRUCTED configs finds
+        that class of problem directly. Off unless MODEL_REPRO_CONFIG_DUMP is set.
+        """
+        output_dir = os.environ.get("MODEL_REPRO_CONFIG_DUMP")
+        if not output_dir:
+            return
+        config = getattr(model, "config", None)
+        if config is None:
+            for sublayer in model.sublayers():
+                config = getattr(sublayer, "config", None)
+                if config is not None:
+                    break
+        if config is None:
+            logger.warning("[CONFIG-DUMP] no model config found")
+            return
+
+        def normalise(value):
+            if value is None or isinstance(value, (bool, int, float, str)):
+                return value
+            if isinstance(value, (list, tuple)):
+                return [normalise(v) for v in value]
+            if isinstance(value, dict):
+                return {str(k): normalise(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+            name = getattr(value, "__name__", None)
+            if name:
+                keywords = getattr(value, "keywords", None)
+                return f"{name}({normalise(keywords)})" if keywords else name
+            if hasattr(value, "func"):
+                return f"partial({normalise(value.func)},{normalise(getattr(value, 'keywords', None))})"
+            return f"<{type(value).__name__}>"
+
+        fields = {}
+        for key in dir(config):
+            if key.startswith("_"):
+                continue
+            try:
+                value = getattr(config, key)
+            except Exception:
+                continue
+            if getattr(value, "__self__", None) is not None:
+                continue
+            if callable(value) and key not in {
+                "activation_func",
+                "hidden_act",
+                "init_method",
+                "output_layer_init_method",
+            }:
+                continue
+            fields[key] = normalise(value)
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"paddle_rank{rank}.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "schema": "glm52-constructed-config/v1",
+                    "framework": "paddle",
+                    "rank": rank,
+                    "fields": fields,
+                },
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            stream.write("\n")
+        logger.info(f"[CONFIG-DUMP] wrote {path} with {len(fields)} fields")
+
+    def _install_forward_contract_once(self, model):
+        output_dir = os.environ.get("MODEL_REPRO_FORWARD_RECEIPT_DIR")
+        if not output_dir or getattr(self, "_forward_contract_installed", False) or model is None:
+            return
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        self._dump_constructed_config(model, rank)
+        boundary_set = os.environ.get("MODEL_REPRO_FORWARD_BOUNDARY_SET", "coarse")
+        fine_specs = self._forward_contract_specs(boundary_set)
+        self._forward_contract_boundary_set = boundary_set
+        handles = []
+        if fine_specs is not None:
+            selected = []
+            if True:
+                module_hits = {name: [] for name in fine_specs}
+                for module_name, module in model.named_sublayers():
+                    if module_name in module_hits:
+                        module_hits[module_name].append(module)
+                invalid = {name: len(hits) for name, hits in module_hits.items() if len(hits) != 1}
+                if invalid and boundary_set == "layer0_fine" and rank < 2:
+                    raise RuntimeError(f"layer0 fine forward selectors must match exactly once on rank {rank}: {invalid}")
+                for module_name, boundary in fine_specs.items():
+                    hits = module_hits[module_name]
+                    if len(hits) != 1:
+                        continue
+                    module = hits[0]
+                    handles.append(module.register_forward_post_hook(
+                        lambda _module, _inputs, output, name=boundary: self._write_forward_record(name, output)
+                    ))
+                    selected.append({"module": module_name, "boundary": boundary})
+            self._forward_contract_selector_receipt = selected
+            rank_dir = os.path.join(output_dir, f"rank{rank}")
+            os.makedirs(rank_dir, exist_ok=True)
+            with open(os.path.join(rank_dir, "metadata.json"), "w", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "schema": "glm52-local-forward-boundaries/v1",
+                        "framework": "paddle",
+                        "rank": rank,
+                        "world_size": paddle.distributed.get_world_size()
+                        if paddle.distributed.is_initialized()
+                        else 1,
+                        "boundary_set": boundary_set,
+                        "selectors": selected,
+                        "records": {},
+                    },
+                    stream,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                stream.write("\n")
+            self._forward_contract_handles = handles
+            self._forward_contract_installed = True
+            return
+        base_layers = {"1": 0, "2": 1, "3": 2, "4": 3}
+        for module_name, module in model.named_sublayers():
+            boundary = None
+            if module_name == "0.embedding":
+                boundary = "embedding_output"
+            elif module_name in base_layers:
+                global_layer = base_layers[module_name]
+                input_boundary = f"base_layer_{global_layer}_input"
+                handles.append(module.register_forward_pre_hook(
+                    lambda _module, inputs, name=input_boundary: self._write_forward_record(name, inputs)
+                ))
+                boundary = f"base_layer_{global_layer}_output"
+            elif module_name == "5":
+                boundary = "final_norm_output"
+            elif module_name == "7":
+                handles.append(module.register_forward_pre_hook(
+                    lambda _module, inputs, name="output_head_input": self._write_forward_record(name, inputs)
+                ))
+                boundary = "output_head_output"
+            elif module_name == "6":
+                boundary = "mtp_layer_output"
+            elif module_name.startswith("6.") and module_name.rsplit(".", 1)[-1] in {
+                "enorm", "hnorm", "eh_proj", "transformer_layer", "final_layernorm"
+            }:
+                boundary = f"mtp_{module_name.removeprefix('6.').replace('.', '_')}_output"
+            elif module_name in _MTP_LAYER_INTERNAL_BRANCH_INPUTS:
+                # E-238: the two MoE branches are fed the SAME tensor, so their
+                # input gradients are what separates them; a pre-hook is the only
+                # way to observe a module input that is nobody's output.
+                name = _MTP_LAYER_INTERNAL_BRANCH_INPUTS[module_name]
+                handles.append(module.register_forward_pre_hook(
+                    lambda _module, inputs, name=name: self._write_forward_record(name, inputs)
+                ))
+                boundary = _MTP_LAYER_INTERNAL_BOUNDARIES.get(module_name)
+            elif module_name in _MTP_LAYER_INTERNAL_BOUNDARIES:
+                # E-237: the MTP transformer layer is ENTERED with a bit-equal
+                # gradient and LEFT with a differing one (E-236), while its forward
+                # is bit-exact. These are its internal boundaries, named
+                # canonically so the two frameworks' differing module names pair up
+                # by NAME rather than by emission order (E-216).
+                boundary = _MTP_LAYER_INTERNAL_BOUNDARIES[module_name]
+            if boundary is not None:
+                handles.append(module.register_forward_post_hook(
+                    lambda _module, _inputs, output, name=boundary: self._write_forward_record(name, output)
+                ))
+        self._forward_contract_handles = handles
+        self._forward_contract_installed = True
+
+    def _write_parameter_contract_once(self, model):
+        if not self.parameter_receipt_dir or self._parameters_written or model is None:
+            return
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        parameter_match = os.environ.get("MODEL_REPRO_PARAMETER_RECEIPT_MATCH")
+        parameters = [
+            {"name": name, **self._parameter_record(param)}
+            for name, param in model.named_parameters()
+            if not parameter_match or parameter_match in name
+        ]
+        raw_dir = os.environ.get("MODEL_REPRO_PARAMETER_RAW_DIR")
+        if raw_dir:
+            os.makedirs(raw_dir, exist_ok=True)
+            named_parameters = dict(model.named_parameters())
+            for item in parameters:
+                name = item["name"]
+                safe = name.replace("/", "_").replace(".", "_")
+                named_parameters[name].detach().cast("float32").cpu().numpy().tofile(os.path.join(raw_dir, f"rank{rank}_{safe}.f32.bin"))
+        payload = {
+            "schema": "glm52-loaded-parameter-inventory/v1",
+            "framework": "paddle",
+            "rank": rank,
+            "world_size": paddle.distributed.get_world_size() if paddle.distributed.is_initialized() else 1,
+            "parameters": parameters,
+            "parameter_count": len(parameters),
+            "local_numel": sum(item["numel"] for item in parameters),
+        }
+        os.makedirs(self.parameter_receipt_dir, exist_ok=True)
+        path = os.path.join(self.parameter_receipt_dir, f"rank{rank}.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+        self._parameters_written = True
+
+    @staticmethod
+    def _gradient_statistics(grad):
+        """Shape-independent magnitude summary, so a gradient whose layout differs
+        between frameworks can still be compared numerically."""
+        array = grad.detach().astype("float64").cpu().numpy().reshape(-1)
+        return {
+            "sumsq": float((array * array).sum()),
+            "absmax": float(abs(array).max()) if array.size else 0.0,
+            "abssum": float(abs(array).sum()),
+            "nonzero": int((array != 0).sum()),
+        }
+
+    def _write_gradient_contract(self, state, model):
+        """Dump per-parameter gradient hashes right before the optimizer step.
+
+        Symmetric with the torch-side receipt written by
+        ``swift/megatron/trainers/base.py`` just before ``optimizer.step()``, so a
+        step-N backward pass can be compared parameter by parameter. Records
+        ``main_grad`` when the fp32 gradient buffer exists (the usual bf16 path) and
+        falls back to ``grad``.
+        """
+        output_dir = os.environ.get("MODEL_REPRO_GRAD_RECEIPT_DIR")
+        if not output_dir or model is None:
+            return
+        step = int(state.global_step) + 1
+        want = os.environ.get("MODEL_REPRO_GRAD_RECEIPT_STEPS")
+        if want and str(step) not in {piece.strip() for piece in want.split(",")}:
+            return
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        # SPGradSyncCallback also runs at on_optimizer_begin, and callback order is not
+        # guaranteed, so a sequence-parallel parameter's gradient may still be the
+        # rank-local contribution here while the reference framework's is already
+        # all-reduced over the tensor-parallel group. Reduce a COPY for the receipt so
+        # both sides describe the same quantity without disturbing training.
+        try:
+            from paddle.distributed.fleet import fleet as _fleet
+            from paddle.distributed.fleet.utils.sequence_parallel_utils import (
+                is_sequence_parallel_parameter as _is_sp_param,
+            )
+
+            _mp_group = _fleet.get_hybrid_communicate_group().get_model_parallel_group()
+        except Exception:
+            _is_sp_param = None
+            _mp_group = None
+
+        # E-235: under the accuracy-compatible path the token normalization is
+        # deferred out of the bf16 gradient path and applied by the trainer to the
+        # fp32 buffers AFTER these callbacks. This receipt therefore sees the
+        # UNNORMALIZED gradient. Scale the receipt copy by the pending divisor so
+        # it keeps describing the gradient the optimizer consumes - otherwise a
+        # comparison against the reference is off by exactly the token count.
+        _pending_divisor = None
+        try:
+            from paddlefleet.models.common.language_loss.language_loss import (
+                get_pending_gradient_divisor as _get_pending_divisor,
+            )
+
+            _pending_divisor = _get_pending_divisor()
+        except ImportError:
+            _pending_divisor = None
+        _receipt_scale = (
+            1.0 / float(_pending_divisor)
+            if _pending_divisor and float(_pending_divisor) > 0
+            else None
+        )
+
+        gradients = []
+        for name, param in model.named_parameters():
+            grad = getattr(param, "main_grad", None)
+            source = "main_grad"
+            if grad is None:
+                grad = param.grad
+                source = "grad"
+            if grad is None:
+                gradients.append({"name": name, "source": "none"})
+                continue
+            sp = bool(_is_sp_param(param)) if _is_sp_param is not None else False
+            if sp and _mp_group is not None and _mp_group.nranks > 1:
+                grad = grad.clone()
+                paddle.distributed.all_reduce(grad, group=_mp_group)
+            if _receipt_scale is not None:
+                # Scale AFTER the sequence-parallel all-reduce, mirroring the order
+                # the trainer will use on the real buffers.
+                grad = grad * _receipt_scale
+            gradients.append(
+                {
+                    "name": name,
+                    "source": source,
+                    "sequence_parallel": sp,
+                    **self._parameter_record(grad),
+                    **self._gradient_statistics(grad),
+                }
+            )
+        payload = {
+            "schema": "glm52-gradient-inventory/v1",
+            "framework": "paddle",
+            "rank": rank,
+            "step": step,
+            "gradients": gradients,
+            "gradient_count": len(gradients),
+        }
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"rank{rank}_step{step}.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+        self._dump_selected_gradients(
+            model, output_dir, rank, step, _receipt_scale, _is_sp_param, _mp_group
+        )
+
+    def _dump_selected_gradients(
+        self, model, output_dir, rank, step, _receipt_scale=None, _is_sp_param=None, _mp_group=None
+    ):
+        """Write raw fp32 gradients for names matching MODEL_REPRO_GRAD_DUMP_MATCH.
+
+        Apply the same SP all-reduce + pending-divisor scale as the hash
+        receipt so the bins are the gradient the optimizer consumes.
+        """
+        match = os.environ.get("MODEL_REPRO_GRAD_DUMP_MATCH")
+        if not match:
+            return
+        needles = [piece.strip() for piece in match.split(",") if piece.strip()]
+        for name, param in model.named_parameters():
+            if not any(needle in name for needle in needles):
+                continue
+            grad = getattr(param, "main_grad", None)
+            if grad is None:
+                grad = param.grad
+            if grad is None:
+                continue
+            sp = bool(_is_sp_param(param)) if _is_sp_param is not None else False
+            if sp and _mp_group is not None and _mp_group.nranks > 1:
+                grad = grad.clone()
+                paddle.distributed.all_reduce(grad, group=_mp_group)
+            if _receipt_scale is not None:
+                grad = grad * _receipt_scale
+            array = np.ascontiguousarray(grad.detach().astype("float32").cpu().numpy())
+            safe = name.replace("/", "_").replace(".", "_")
+            base = os.path.join(output_dir, f"rank{rank}_step{step}_{safe}")
+            array.tofile(base + ".bin")
+            with open(base + ".json", "w", encoding="utf-8") as stream:
+                json.dump({"name": name, "shape": list(array.shape), "dtype": "float32", "sequence_parallel": sp}, stream)
+
+    def on_optimizer_begin(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+        if model is not None:
+            self._last_model = model
+        self._restore_moe_gate_master(args, model)
+        self._write_gradient_contract(state, model)
+
+    def _write_post_optimizer_params(self, state, model):
+        """Dump-only post-step parameter hashes. Observation, not a wrap."""
+        output_dir = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_DIR")
+        if not output_dir or model is None:
+            return
+        step = int(state.global_step) + 1
+        want = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_STEPS", "1")
+        if want and str(step) not in {piece.strip() for piece in want.split(",")}:
+            return
+        needles_raw = os.environ.get(
+            "MODEL_REPRO_POST_OPT_PARAM_MATCH",
+            "enorm,hnorm,router,gate,shared_experts,up_gate_proj,down_proj,embed_tokens,word_embeddings",
+        )
+        needles = [piece.strip() for piece in needles_raw.split(",") if piece.strip()]
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        parameters = []
+        for name, param in model.named_parameters():
+            if needles and not any(needle in name for needle in needles):
+                continue
+            parameters.append({"name": name, **self._parameter_record(param)})
+        payload = {
+            "schema": "glm52-post-optimizer-param-inventory/v1",
+            "framework": "paddle",
+            "rank": rank,
+            "step": step,
+            "parameters": parameters,
+            "parameter_count": len(parameters),
+        }
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"rank{rank}_step{step}.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+        raw_needles_env = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_RAW")
+        if raw_needles_env:
+            raw_needles = [piece.strip() for piece in raw_needles_env.split(",") if piece.strip()]
+            raw_dir = os.path.join(output_dir, "raw")
+            os.makedirs(raw_dir, exist_ok=True)
+            named = dict(model.named_parameters())
+            for name, param in named.items():
+                if not any(needle in name for needle in raw_needles):
+                    continue
+                if "e_score" in name:
+                    continue
+                rec_param = param
+                if hasattr(rec_param, "is_dist") and rec_param.is_dist():
+                    rec_param = rec_param._local_value()
+                array = np.ascontiguousarray(rec_param.detach().contiguous().cpu().numpy())
+                safe = name.replace("/", "_").replace(".", "_")
+                array.tofile(os.path.join(raw_dir, f"rank{rank}_step{step}_{safe}.bin"))
+        print(
+            f"[POST-OPT-PARAM] paddle rank={rank} step={step} n={len(parameters)}",
+            flush=True,
+        )
+
+    def _iter_moe_gate_params(self, model):
+        for name, param in model.named_parameters():
+            if "mlp.gate.weight" not in name:
+                continue
+            if "e_score" in name:
+                continue
+            if param.dtype != paddle.float32:
+                continue
+            yield name, param
+
+    def _restore_moe_gate_master(self, args, model):
+        """Copy the unrounded fp32 master back into the live Parameter.
+
+        Megatron AdamW updates ``fp32_from_float16_groups`` then copies that
+        master onto the bf16 model Parameter. Paddle's live Parameter *is*
+        the master (checkpoint loader requires fp32), so the previous
+        copy-back rounded it in place and the next AdamW started from the
+        truncated value. Restore the master first. Default path unchanged.
+        """
+        if model is None or not bool(getattr(args, "use_accuracy_compatible", False)):
+            return
+        if not self._uac_gate_master:
+            return
+        n = 0
+        for name, param in self._iter_moe_gate_params(model):
+            master = self._uac_gate_master.get(name)
+            if master is None:
+                continue
+            param.copy_(master, False)
+            n += 1
+        if n:
+            print(f"[UAC-GATE-MASTER-RESTORE] n={n}", flush=True)
+
+    def _round_moe_gate_to_bf16(self, args, model):
+        """UAC-only: Megatron-style main→model bf16 copy-back after AdamW.
+
+        Keep an unrounded fp32 master clone; write the bf16-rounded view
+        into the live Parameter so the next forward matches Megatron's
+        ``weight.float()`` of a bf16 Parameter. GEMM / backward unchanged.
+        Default (non-UAC) path unchanged.
+        """
+        if model is None or not bool(getattr(args, "use_accuracy_compatible", False)):
+            return
+        n = 0
+        for name, param in self._iter_moe_gate_params(model):
+            # Clone before rounding: this is the fused-AdamW master.
+            self._uac_gate_master[name] = param.detach().clone()
+            # copy_(False) keeps the Parameter identity. paddle.assign wraps
+            # AssignOutGrad and clears TensorWrappers, so the next backward
+            # raises "calculate backward twice".
+            rounded = param.detach().astype("bfloat16").astype("float32")
+            param.copy_(rounded, False)
+            n += 1
+        if n:
+            print(f"[UAC-GATE-BF16-COPYBACK] n={n}", flush=True)
+
+    def _write_adam_moments(self, state, optimizer, model=None):
+        """Dump-only Adam moment / master hashes keyed by named_parameters.
+
+        Accumulator dicts are keyed by Tensor ``.name`` (``linear_12.w_0``),
+        not the module path, so matching ``q_a_proj`` must go through
+        ``named_parameters``. Observation, not a wrap.
+        """
+        output_dir = os.environ.get("MODEL_REPRO_ADAM_MOMENT_DIR")
+        if not output_dir or optimizer is None:
+            return
+        step = int(state.global_step) + 1
+        want = os.environ.get("MODEL_REPRO_ADAM_MOMENT_STEPS", "3")
+        if want and str(step) not in {piece.strip() for piece in want.split(",")}:
+            return
+        inner = optimizer
+        while hasattr(inner, "_inner_opt"):
+            inner = inner._inner_opt
+        acc = getattr(inner, "_accumulators", None) or {}
+        master = getattr(inner, "_master_weights", None) or {}
+        rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+        needles_raw = os.environ.get("MODEL_REPRO_ADAM_MOMENT_MATCH", "")
+        needles = [piece.strip() for piece in needles_raw.split(",") if piece.strip()]
+        named = list(model.named_parameters()) if model is not None else []
+        records = []
+        for name, param in named:
+            if needles and not any(needle in name for needle in needles):
+                continue
+            if "e_score" in name:
+                continue
+            tname = getattr(param, "name", None)
+            rec = {
+                "param_name": name,
+                "param_tensor_name": tname,
+                "param": self._parameter_record(param),
+            }
+            master_t = master.get(tname) if tname else None
+            if master_t is not None:
+                rec["master"] = self._parameter_record(master_t)
+            # Moments of bf16 params are stored on the fp32 master tensor name.
+            moment_keys = [k for k in (tname, getattr(master_t, "name", None)) if k]
+            moments = {}
+            for kind, by_name in acc.items():
+                for key in moment_keys:
+                    if key in by_name:
+                        moments[str(kind)] = self._parameter_record(by_name[key])
+                        break
+            rec["moments"] = moments
+            if name in self._uac_gate_master:
+                rec["uac_gate_master"] = self._parameter_record(self._uac_gate_master[name])
+            records.append(rec)
+        payload = {
+            "schema": "glm52-adam-moment-inventory/v2",
+            "framework": "paddle",
+            "rank": rank,
+            "step": step,
+            "moments": records,
+            "moment_count": len(records),
+            "accumulator_kinds": sorted(str(k) for k in acc.keys()),
+            "named_parameter_count": len(named),
+            "master_weight_count": len(master),
+        }
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"rank{rank}_step{step}.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+        raw_needles_env = os.environ.get("MODEL_REPRO_ADAM_MOMENT_RAW")
+        if raw_needles_env:
+            raw_needles = [piece.strip() for piece in raw_needles_env.split(",") if piece.strip()]
+            raw_dir = os.path.join(output_dir, "raw")
+            os.makedirs(raw_dir, exist_ok=True)
+            named_map = dict(named)
+            for name, param in named_map.items():
+                if not any(needle in name for needle in raw_needles):
+                    continue
+                if "e_score" in name:
+                    continue
+                tname = getattr(param, "name", None)
+                master_t = master.get(tname) if tname else None
+                safe = name.replace("/", "_").replace(".", "_")
+                if master_t is not None:
+                    rec_t = master_t
+                    if hasattr(rec_t, "is_dist") and rec_t.is_dist():
+                        rec_t = rec_t._local_value()
+                    array = np.ascontiguousarray(rec_t.detach().contiguous().cpu().numpy())
+                    array.tofile(os.path.join(raw_dir, f"rank{rank}_step{step}_{safe}_master.bin"))
+                uac = self._uac_gate_master.get(name)
+                if uac is not None:
+                    array = np.ascontiguousarray(uac.detach().contiguous().cpu().numpy())
+                    array.tofile(os.path.join(raw_dir, f"rank{rank}_step{step}_{safe}_uacmaster.bin"))
+        print(
+            f"[ADAM-MOMENT] paddle rank={rank} step={step} n={len(records)} "
+            f"kinds={payload['accumulator_kinds']} masters={len(master)}",
+            flush=True,
+        )
+
+    def on_optimizer_end(self, args, state, control, **kwargs):
+        model = kwargs.get("model") or self._last_model
+        self._round_moe_gate_to_bf16(args, model)
+        self._write_post_optimizer_params(state, model)
+        self._write_adam_moments(state, kwargs.get("optimizer"), model=model)
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not self._is_writer(state):
+            return
+        if self.raw_loss_path:
+            raw_path = Path(self.raw_loss_path).expanduser().resolve()
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.unlink(missing_ok=True)
+        if self.env_path:
+            self._write_json(self.env_path, self._environment_payload(args))
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if not self.loss_path or not self._is_writer(state):
+            return
+        raw_path = Path(self.raw_loss_path).expanduser().resolve() if self.raw_loss_path else None
+        payload = self._machine_loss_payload(
+            self._loss_events,
+            raw_path=raw_path,
+            source_sha256=self._sha256_file(raw_path) if raw_path and raw_path.is_file() else None,
+        )
+        self._write_json(self.loss_path, payload)
+
+    def on_load_data_end(self, args, state, control, inputs=None, **kwargs):
+        model = kwargs.get("model")
+        _dump = os.environ.get("MODEL_REPRO_INPUT_DUMP_DIR")
+        if _dump and inputs is not None and "input_ids" in inputs:
+            import hashlib as _hashlib
+
+            _ids = inputs["input_ids"]
+            _rk = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+            _gb = int(state.global_step)
+            _arr = _ids.detach().cpu().numpy()
+            os.makedirs(_dump, exist_ok=True)
+            _arr.tofile(os.path.join(_dump, f"paddle_input_ids_step{_gb}_rank{_rk}.bin"))
+            _h = _hashlib.md5(_arr.tobytes()).hexdigest()
+            print(
+                f"[INPUT-DUMP] step{_gb} rank{_rk} ids shape={tuple(_arr.shape)} "
+                f"md5={_h} len={_arr.size}",
+                flush=True,
+            )
+            for _k in ("labels", "position_ids", "attn_mask_startend_row_indices"):
+                if _k in inputs:
+                    _t = inputs[_k]
+                    _a = _t.detach().cpu().numpy()
+                    _a.tofile(os.path.join(_dump, f"paddle_{_k}_step{_gb}_rank{_rk}.bin"))
+                    print(
+                        f"[INPUT-DUMP] step{_gb} rank{_rk} {_k} shape={tuple(_a.shape)} "
+                        f"md5={_hashlib.md5(_a.tobytes()).hexdigest()}",
+                        flush=True,
+                    )
+        self._write_parameter_contract_once(model)
+        self._install_forward_contract_once(model)
+        if not self.input_receipt_path or self._input_written or not self._is_writer(state):
+            return
+        inputs = inputs or {}
+        input_ids = inputs.get("input_ids")
+        labels = inputs.get("labels")
+        position_ids = inputs.get("position_ids")
+        if input_ids is None or labels is None:
+            return
+        input_values = self._values(input_ids)
+        label_values = self._values(labels)
+        position_values = self._values(position_ids) if position_ids is not None else None
+        mask_values = [label != -100 for label in label_values]
+        semantic_input_values, semantic_label_values, semantic_mask_values = project_owning_loader_semantics(
+            input_values, label_values, position_values
+        )
+        mtp_depth = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
+        has_mtp_sentinel = (
+            mtp_depth > 0
+            and len(input_values) - len(semantic_input_values) >= mtp_depth
+            and label_values[-mtp_depth:] == [-100] * mtp_depth
+            and (position_values is None or position_values[-mtp_depth:] == [0] * mtp_depth)
+        )
+        payload = {
+            "schema": "glm52-owning-loader-input/v1",
+            "framework": "paddle",
+            "rank": paddle.distributed.get_rank(),
+            "step": int(state.global_step) + 1,
+            "input_ids": {
+                "shape": list(input_ids.shape),
+                "dtype": str(input_ids.dtype),
+                "count": len(input_values),
+                "sha256": self._digest(input_values),
+            },
+            "labels": {
+                "shape": list(labels.shape),
+                "dtype": str(labels.dtype),
+                "count": len(label_values),
+                "supervised_count": sum(mask_values),
+                "sha256": self._digest(label_values),
+            },
+            "loss_mask": {
+                "shape": list(labels.shape),
+                "dtype": "bool",
+                "count": len(mask_values),
+                "supervised_count": sum(mask_values),
+                "sha256": self._digest(mask_values),
+            },
+            "semantic": {
+                "input_token_count": len(semantic_input_values),
+                "supervised_target_count": sum(semantic_mask_values),
+                "input_ids_sha256": self._digest(semantic_input_values),
+                "labels_sha256": self._digest(semantic_label_values),
+                "loss_mask_sha256": self._digest(semantic_mask_values),
+                "projection": "dataset_row_before_paddle_padding_and_label_roll",
+            },
+            "carrier_padding": {
+                "count": len(input_values) - len(semantic_input_values),
+                "input_ids_sha256": self._digest(input_values[len(semantic_input_values) :]),
+                "labels_sha256": self._digest(label_values[len(semantic_input_values) :]),
+            },
+            "mtp_sentinel": {
+                "expected_depth": mtp_depth,
+                "present": has_mtp_sentinel,
+                "carrier_token_count": len(input_values),
+            },
+            "ignore_index": -100,
+            "dataset": os.environ.get("MODEL_REPRO_INPUT_DATASET_PATH"),
+        }
+        path = os.path.abspath(os.path.expanduser(self.input_receipt_path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+        self._input_written = True
+
+    def on_log(self, args, state, control, logs=None, raw_loss=None, **kwargs):
+        if not self.raw_loss_path or raw_loss is None or not self._is_writer(state):
+            return
+        event = {"step": int(state.global_step), "loss": float(raw_loss)}
+        for key, value in (logs or {}).items():
+            normalized_key = key.replace(" ", "_")
+            if normalized_key.startswith("mtp_") and normalized_key.endswith("_loss"):
+                event[normalized_key] = float(value)
+        path = os.path.abspath(os.path.expanduser(self.raw_loss_path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+        self._loss_events.append(event)
+
+
 # Fine-tune Environment Variables to support sharding stage1 overlap optimization.
 os.environ["USE_CASUAL_MASK"] = "False"
 
@@ -85,6 +1241,183 @@ from paddleformers.cli.utils import (
     get_lora_target_modules,
     get_multimodel_lora_target_modules,
 )
+
+
+def load_tokenizer_and_processor(model_args, data_args):
+    tokenizer_path = model_args.tokenizer_name_or_path or model_args.model_name_or_path
+    # Local workspace paths contain '__' and are not HuggingFace repo ids.
+    # Resolve to an existing directory so AutoTokenizer does not call hub.
+    if tokenizer_path and os.path.isdir(os.path.expanduser(tokenizer_path)):
+        tokenizer_path = os.path.abspath(os.path.expanduser(tokenizer_path))
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    logger.info(f"Loading tokenizer from {tokenizer_path}")
+    if "VL" in model_args.stage:
+        processor = AutoProcessor.from_pretrained(
+            model_args.model_name_or_path, use_fast=data_args.processor_use_fast
+        )
+    else:
+        processor = tokenizer
+    return tokenizer, processor
+
+
+def save_final_hf_model_if_requested(trainer, training_args):
+    """Avoid a duplicate full-parameter export when native checkpoints are requested."""
+    if not training_args.save_to_hf:
+        logger.info("Skipping final HuggingFace export because save_to_hf=false.")
+        return False
+    trainer.save_model(
+        merge_tensor_parallel=training_args.tensor_model_parallel_size > 1,
+        last_fc_to_hf=True,
+    )
+    return True
+
+
+def validate_pretokenized_offline_dataset(dataset, expected_length):
+    if dataset is None or len(dataset) == 0:
+        raise ValueError("pretokenized offline dataset must contain at least one row")
+    for row in dataset:
+        if not isinstance(row, list) or len(row) != 1:
+            raise ValueError("pretokenized offline rows must contain exactly one TextSequence")
+        sequence = row[0]
+        fields = {
+            "token_ids": sequence.token_ids,
+            "labels": sequence.labels,
+            "position_ids": sequence.position_ids,
+        }
+        for name, values in fields.items():
+            if len(values) != expected_length:
+                raise ValueError(f"pretokenized {name} length {len(values)} != {expected_length}")
+            if any(not isinstance(value, int) for value in values):
+                raise TypeError(f"pretokenized {name} must contain integer values")
+
+
+def apply_glm_moe_dsa_training_contract(model_config, training_args, model_args, data_args):
+    """Propagate CLI training semantics into the Fleet provider used by GLM MoE DSA."""
+    if getattr(model_config, "model_type", None) != "glm_moe_dsa":
+        return
+
+    requested_mtp = int(getattr(training_args, "num_nextn_predict_layers", 0) or 0)
+    explicit_mtp = int(getattr(training_args, "mtp_num_layers", 0) or 0)
+    if requested_mtp and explicit_mtp and requested_mtp != explicit_mtp:
+        raise ValueError(
+            f"GLM MoE DSA MTP depth mismatch: num_nextn_predict_layers={requested_mtp}, "
+            f"mtp_num_layers={explicit_mtp}"
+        )
+    mtp_depth = explicit_mtp or requested_mtp
+    model_config.num_nextn_predict_layers = mtp_depth
+    model_config.mtp_num_layers = mtp_depth
+    training_args.num_nextn_predict_layers = mtp_depth
+    training_args.mtp_num_layers = mtp_depth
+    model_config.mtp_enabled = mtp_depth > 0
+
+    # MTP loss weight. LlmMetaConfig registers this attribute with default 0.1
+    # (configuration_utils.py mtp_attributes), matching Megatron-LM's
+    # TransformerConfig default, and GLMMoEModelProvider declares the same 0.1
+    # (transformers/glm4_moe/modeling.py). training_args.mtp_loss_scaling_factor
+    # defaults to None so set_llm_config leaves that registered value alone; an
+    # explicit CLI value is propagated here, after set_llm_config, so the resolved
+    # weight is traceable to the YAML rather than to a class default.
+    requested_mtp_loss_scaling_factor = getattr(training_args, "mtp_loss_scaling_factor", None)
+    if requested_mtp_loss_scaling_factor is not None:
+        model_config.mtp_loss_scaling_factor = float(requested_mtp_loss_scaling_factor)
+    logger.info(
+        "GLM MoE DSA MTP loss weight: mtp_loss_scaling_factor="
+        f"{getattr(model_config, 'mtp_loss_scaling_factor', None)} "
+        f"(cli={requested_mtp_loss_scaling_factor!r}, mtp_depth={mtp_depth})"
+    )
+
+    if data_args.pretokenized_dataset and mtp_depth > 0 and not model_args.mtp_attention_flexible:
+        raise ValueError("pretokenized GLM MoE DSA MTP requires mtp_attention_flexible=true")
+
+    model_config.fp32_residual_connection = training_args.fp32_residual_connection
+    model_config.moe_token_dispatcher_type = training_args.moe_token_dispatcher_type
+    model_config.moe_router_bias_update_rate = float(
+        getattr(training_args, "moe_router_bias_update_rate", 0.001)
+    )
+    # GLM-5.2 repro: take the accuracy-compatible grouped-GEMM MoE branch
+    # (`_forward_single_card_grouped_gemm_moe` + `moe_utils.unpermute`, which has
+    # the aligned fp32 accumulate path under FLAGS_use_accuracy_compatible_kernel)
+    # instead of the per-expert python loop (`_forward_single_card_moe`), which
+    # has no accuracy-compatible treatment. set_llm_config() overwrites this
+    # attribute to its default (False) because the CLI args dataclass lacks the
+    # field, so we must apply it here AFTER that call. The CLI YAML key does not
+    # reliably flow into the dataclass, so honour an explicit env override too.
+    _moe_expert_fusion = getattr(training_args, "moe_expert_fusion", None)
+    _moe_expert_fusion_env = os.environ.get("MODEL_REPRO_MOE_FUSION", None)
+    print(
+        f"[MOE-FUSION-DEBUG] env={_moe_expert_fusion_env!r} args={_moe_expert_fusion!r} "
+        f"model_type={getattr(model_config, 'model_type', None)}",
+        flush=True,
+    )
+    try:
+        import paddlefleet as _pf
+        import paddlefleet.transformer.moe.moe_layer as _ml
+
+        print(
+            f"[MOE-FUSION-DEBUG] paddlefleet={_pf.__file__} moe_layer={_ml.__file__}",
+            flush=True,
+        )
+    except Exception as _e:
+        print(f"[MOE-FUSION-DEBUG] import err {_e}", flush=True)
+    if _moe_expert_fusion_env is not None:
+        model_config.moe_expert_fusion = _moe_expert_fusion_env == "1"
+    elif _moe_expert_fusion is not None:
+        model_config.moe_expert_fusion = bool(_moe_expert_fusion)
+    # E-250: bias_activation_fusion selects a structurally different activation
+    # gradient, and the two frameworks disagreed on it. The reference sets it false
+    # (megatron transformer_config default), so mlp.py evaluates the plain glu
+    # closure `activation_func(x_glu) * (x_linear + offset)` and differentiates it
+    # with the native activation gradient - one kernel, one rounding. This side
+    # inherited True from GLMMoEModelProvider, taking bias_swiglu_impl ->
+    # BiasSwiGLUFunction -> the hand-written swiglu_back_eager, whose four-factor
+    # bf16 product chain rounds three extra times. Each side reproduces its own
+    # recorded shared-expert gate-half gradient bit-exactly under its own flag, so
+    # this was a configuration asymmetry rather than a numerical defect. Like
+    # moe_expert_fusion above, the CLI args dataclass has no such field, so the
+    # value is taken from an explicit env override applied AFTER set_llm_config().
+    _bias_activation_fusion_env = os.environ.get("MODEL_REPRO_BIAS_ACTIVATION_FUSION", None)
+    if _bias_activation_fusion_env is not None:
+        model_config.bias_activation_fusion = _bias_activation_fusion_env == "1"
+        print(
+            "[BIAS-ACT-FUSION] model_config.bias_activation_fusion="
+            f"{model_config.bias_activation_fusion}",
+            flush=True,
+        )
+    # P2E2 EP>1: FusionMoePyLayer vs custom_forward. YAML moe_use_fusion_node
+    # is on LlmMetaConfig, but provider default True still wins unless applied
+    # after set_llm_config the same way as BIAS. Torch has no equivalent flag.
+    _fusion_node_env = os.environ.get("MODEL_REPRO_MOE_USE_FUSION_NODE", None)
+    if _fusion_node_env is not None:
+        model_config.moe_use_fusion_node = _fusion_node_env == "1"
+    print(
+        "[FUSION-NODE] model_config.moe_use_fusion_node="
+        f"{getattr(model_config, 'moe_use_fusion_node', None)} "
+        f"env={_fusion_node_env!r} args={getattr(training_args, 'moe_use_fusion_node', None)!r}",
+        flush=True,
+    )
+    for parallel_field in (
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "context_parallel_size",
+        "expert_model_parallel_size",
+    ):
+        configured_size = int(getattr(training_args, parallel_field, -1))
+        setattr(model_config, parallel_field, max(configured_size, 1))
+    model_config.sequence_parallel = bool(getattr(training_args, "sequence_parallel", False))
+    configured_expert_tensor_parallel_size = int(
+        getattr(training_args, "expert_tensor_model_parallel_size", -1)
+    )
+    expert_tensor_parallel_size = (
+        1 if configured_expert_tensor_parallel_size == -1 else configured_expert_tensor_parallel_size
+    )
+    if expert_tensor_parallel_size < 1:
+        raise ValueError(
+            "GLM MoE DSA expert_tensor_model_parallel_size must be -1 or at least 1, "
+            f"got {configured_expert_tensor_parallel_size}"
+        )
+    model_config.expert_tensor_parallel_size = expert_tensor_parallel_size
+    if model_args.persist_layer_norm is not None:
+        model_config.persist_layer_norm = model_args.persist_layer_norm
 
 
 def freeze_param_except_mtp(model, config):
@@ -296,6 +1629,7 @@ def run_sft(
         training_args.prediction_loss_only = True
 
     LlmMetaConfig.set_llm_config(model_config, training_args)
+    apply_glm_moe_dsa_training_contract(model_config, training_args, model_args, data_args)
     model_config.use_fast_layer_norm = model_args.use_fast_layer_norm
 
     # autoregressive mtp training
@@ -412,7 +1746,7 @@ def run_sft(
     runtime_timer = RuntimeTimer("Creating SFT MapDataset")
 
     # Load tokenizer & processor & dataset
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+    tokenizer, processor = load_tokenizer_and_processor(model_args, data_args)
     add_new_special_tokens(tokenizer, data_args.new_special_tokens_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -423,8 +1757,6 @@ def run_sft(
 
     if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, Llama3Tokenizer):
         tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path, use_fast=data_args.processor_use_fast)
 
     type_map = {"bf16": "bfloat16", "fp16": "float16"}
     compute_type = type_map.get(training_args.compute_type, "float32")
@@ -455,6 +1787,7 @@ def run_sft(
         "packed_idx_cache_dir": data_args.packed_idx_cache_dir,
         "dataloader_num_workers": training_args.dataloader_num_workers,
         "template": data_args.template,
+        "enable_thinking": getattr(generating_args, "enable_thinking", None),
         "tool_format": None,
         "default_system": None,
         "truncation_strategy": data_args.truncation_strategy,
@@ -594,6 +1927,11 @@ def run_sft(
             skip_warmup=data_args.skip_warmup,
             warmup_only_rank0=data_args.warmup_only_rank0,
         )
+        if data_args.pretokenized_dataset:
+            validate_pretokenized_offline_dataset(train_dataset, data_args.max_seq_len)
+            if training_args.num_nextn_predict_layers > 0 and data_args.pretokenized_pad_token_id is None:
+                raise ValueError("pretokenized_pad_token_id is required when MTP padding is enabled")
+            logger.info("Using validated pretokenized offline dataset without text tokenization.")
         if training_args.do_eval:
             eval_file_path = os.path.join(data_args.input_dir, "eval")
             eval_dataset = create_indexed_dataset(
@@ -661,6 +1999,9 @@ def run_sft(
                 model_args=model_args,
                 max_seq_len=max_seq_len,
                 padding_free=data_args.padding_free,
+                input_pad_token_id=(
+                    data_args.pretokenized_pad_token_id if data_args.pretokenized_dataset else None
+                ),
             )
 
     if training_args.max_steps == -1:
@@ -712,6 +2053,13 @@ def run_sft(
         training_args.logging_steps = int(training_args.max_steps / training_args.num_train_epochs)
 
     callbacks = []
+    raw_loss_path = os.environ.get("MODEL_REPRO_RAW_LOSS_PATH")
+    input_receipt_path = os.environ.get("MODEL_REPRO_INPUT_RECEIPT_PATH")
+    parameter_receipt_dir = os.environ.get("MODEL_REPRO_PARAMETER_RECEIPT_DIR")
+    env_path = os.environ.get("MODEL_REPRO_ENV_PATH")
+    loss_path = os.environ.get("MODEL_REPRO_LOSS_PATH")
+    if raw_loss_path or input_receipt_path or parameter_receipt_dir or env_path or loss_path:
+        callbacks.append(ModelReproObservationCallback(raw_loss_path, input_receipt_path, parameter_receipt_dir))
     if getattr(model_config.get_text_config(), "topk_method", None) == "noaux_tc":
         callbacks += [MoECorrectionBiasAdjustCallback(lr=training_args.moe_router_bias_update_rate)]
     elif getattr(model_config.get_text_config(), "topk_method", None) == "quantile_balancing":
@@ -772,7 +2120,7 @@ def run_sft(
         )
         logger.info(f"Total_Tokens_per_second_per_gpu: {total_tokens_per_second_per_gpu} ")
         if not training_args.autotuner_benchmark:
-            trainer.save_model(merge_tensor_parallel=training_args.tensor_model_parallel_size > 1, last_fc_to_hf=True)
+            save_final_hf_model_if_requested(trainer, training_args)
             trainer.log_metrics("train", train_result.metrics)
             trainer.save_metrics("train", train_result.metrics)
             trainer.save_state()

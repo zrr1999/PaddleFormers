@@ -115,7 +115,7 @@ class GlmMoeDsaModelTester:
             choice_labels = ids_tensor([self.batch_size], self.num_choices)
 
         config = self.get_config()
-        self.assertTrue(config.use_qk_norm)
+        self.parent.assertTrue(config.use_qk_norm)
         return config, input_ids, input_mask, sequence_labels, token_labels, choice_labels
 
     def get_config(self) -> GlmMoeDsaConfig:
@@ -210,6 +210,7 @@ class GlmMoeDsaModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestC
         config = GlmMoeDsaConfig(rope_interleave=True)
         self.assertTrue(config.rope_interleave)
         self.assertFalse(config.rotary_interleaved)
+        self.assertFalse(config.indexer_rope_interleave)
 
     def test_rotary_interleaved_can_override_frequency_layout(self):
         config = GlmMoeDsaConfig(
@@ -218,6 +219,15 @@ class GlmMoeDsaModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestC
         )
         self.assertFalse(config.rope_interleave)
         self.assertTrue(config.rotary_interleaved)
+        self.assertTrue(config.indexer_rope_interleave)
+
+    def test_official_indexer_rope_interleave_maps_to_rotary_interleaved(self):
+        config = GlmMoeDsaConfig.from_dict({"indexer_rope_interleave": True})
+        self.assertTrue(config.indexer_rope_interleave)
+        self.assertTrue(config.rotary_interleaved)
+        serialized = config.to_dict()
+        self.assertTrue(serialized["indexer_rope_interleave"])
+        self.assertNotIn("rotary_interleaved", serialized)
 
     def test_nested_rope_theta_maps_to_paddlefleet_name(self):
         config = GlmMoeDsaConfig(rope_parameters={"rope_type": "default", "rope_theta": 8_000_000})

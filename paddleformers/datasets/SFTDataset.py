@@ -436,8 +436,6 @@ class BaseSFTDataset:
                             # Set flag to False and yield empty list to signal the end of estimation
                             self.estimate = False
                             yield []
-                if len(batch_sequence) > 0:
-                    yield batch_sequence
                 self.iter_all_examples = True
             else:
                 if self.binpacking:
@@ -643,6 +641,9 @@ class BaseSFTDataset:
                     logger.info("[dataset debug] Tokenizer not available")
                 logger.info("=" * 50 + "\n")
 
+        if os.environ.get("MODEL_REPRO_TEMPLATE_DEBUG", "0") == "1" and not getattr(BaseSFTDataset, "_seq_dbg", False):
+            BaseSFTDataset._seq_dbg = True
+            print(f"[SEQDBG] backend={self.template_backend} len={len(tokens)} tail={tokens[-8:]}", flush=True)
             return Sequence(
                 token_ids=tokens,
                 position_ids=pos_ids,
@@ -673,6 +674,19 @@ class BaseSFTDataset:
         mm_inputs = None
 
         if self.use_template:
+            if os.environ.get("MODEL_REPRO_TEMPLATE_DEBUG", "0") == "1" and not getattr(
+                BaseSFTDataset, "_tb_dbg", False
+            ):
+                BaseSFTDataset._tb_dbg = True
+                import inspect as _tbd
+                _m = getattr(self.tokenizer, "encode_chat_inputs", None)
+                print(
+                    f"[TPLDBG] SFTDataset={__file__} tok_type={[c.__name__ for c in type(self.tokenizer).__mro__[:3]]} "
+                    f"encode_chat_inputs={getattr(_m, '__module__', None) or getattr(_m, '__qualname__', None)} "
+                    f"backend={self.template_backend} use_template={self.use_template} "
+                    f"tpl={getattr(self, 'template', None)} chat_tpl={bool(getattr(self.tokenizer, 'chat_template', None))}",
+                    flush=True,
+                )
             if self.template_backend == "jinja":
                 if not self.tokenizer.chat_template:
                     self.tokenizer.chat_template = NONE_CHAT_TEMPLATE
@@ -789,7 +803,7 @@ class BaseSFTDataset:
                 labels = [-100] + labels
 
             # Add EOS token at the end
-            if self.efficient_eos:
+            if self.efficient_eos and os.environ.get("MODEL_REPRO_NO_EXTRA_EOS", "0") != "1":
                 tokens.extend(suffix_ids)
                 labels.extend(suffix_ids)
 
@@ -803,6 +817,13 @@ class BaseSFTDataset:
         else:
             if len(tokens) > self.max_seq_len:
                 raise RuntimeError(f"token_ids is too long: {len(tokens)}")
+
+        # E-186: torch (swift glm5_2 jinja) emits one fewer trailing EOS than the
+        # paddle tokenizer chat pipeline. Trim exactly one trailing EOS so the
+        # input sequences are bit-identical across frameworks.
+        if os.environ.get("MODEL_REPRO_TRIM_TAIL_EOS", "0") == "1" and tokens and tokens[-1] == self.tokenizer.eos_token_id:
+            tokens = tokens[:-1]
+            labels = labels[:-1]
 
         # label shift
         labels = labels[1:] + [-100]
@@ -833,6 +854,9 @@ class BaseSFTDataset:
                 logger.info("[dataset debug] Tokenizer not available")
             logger.info("=" * 50 + "\n")
 
+        if os.environ.get("MODEL_REPRO_TEMPLATE_DEBUG", "0") == "1" and not getattr(BaseSFTDataset, "_seq_dbg", False):
+            BaseSFTDataset._seq_dbg = True
+            print(f"[SEQDBG] backend={self.template_backend} len={len(tokens)} tail={tokens[-8:]}", flush=True)
         return Sequence(
             token_ids=tokens,
             position_ids=pos_ids,

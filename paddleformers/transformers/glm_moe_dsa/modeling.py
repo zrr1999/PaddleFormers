@@ -365,6 +365,15 @@ class GlmMoeDsaForCausalLMPipe(GlmMoeDsaPreTrainedModel, GeneralModelForCausalLM
         config.multi_latent_attention = True
         model_provider_class = GLMMoEModelProvider
         model_provider = model_provider_class.from_config(config)
+        import os as _os
+
+        if _os.environ.get("MODEL_REPRO_MOE_FUSION", "0") == "1":
+            print(
+                f"[MOE-FUSION-DEBUG] __new__ config.moe_expert_fusion="
+                f"{getattr(config, 'moe_expert_fusion', None)} provider="
+                f"{getattr(model_provider, 'moe_expert_fusion', None)}",
+                flush=True,
+            )
         loss_fn = None
         if getattr(config, "dpo_config", None):
             loss_fn = CriterionLayerPipe(config, use_infohub=True)

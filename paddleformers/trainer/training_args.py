@@ -1273,6 +1273,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Save model to HuggingFace safetensors."},
     )
+    save_to_hf: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Export the final trained model in HuggingFace format."},
+    )
     nccl_comm_group_config: Optional[str] = field(
         default=None,
         metadata={
@@ -1296,6 +1300,19 @@ class TrainingArguments:
     mtp_distillation_loss: bool = field(default=False, metadata={"help": "Whether to use distillation MTP loss."})
     mtp_num_layers: int = field(
         default=0, metadata={"help": "Whether to use Autoregressive MTP Training, activate if > 1."}
+    )
+    mtp_loss_scaling_factor: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Weight of the MTP loss term relative to the main language-model loss. "
+                "When None, the value registered in LlmMetaConfig.mtp_attributes is kept "
+                "(0.1, matching Megatron-LM's TransformerConfig default), so the default "
+                "behaviour is unchanged. Set it explicitly to study or disable the MTP "
+                "contribution: 0.0 severs the MTP loss entirely, including the gradient it "
+                "otherwise contributes to the shared trunk through eh_proj."
+            )
+        },
     )
     profile: bool = field(default=False, metadata={"help": "Enable nsys profiling."})
     profile_step_start: int = field(default=10, metadata={"help": "Step to start nsys profiling."})
@@ -2921,10 +2938,15 @@ class TrainingArguments:
                 self.expert_tensor_model_parallel_size = -1
 
         # NOTE(Waynezee): when moe_expert_fusion is true and sharding_parallel_size = 1,  checkpoint will fail to save
-        if hasattr(self, "moe_expert_fusion") and self.moe_expert_fusion and self.world_size > 1:
+        if (
+            hasattr(self, "moe_expert_fusion")
+            and self.moe_expert_fusion
+            and self.world_size > 1
+            and getattr(self.save_strategy, "value", self.save_strategy) != "no"
+        ):
             assert (
                 self.sharding_parallel_size > 1
-            ), "Checkpoint will fail to save when moe_expert_fusion is true and sharding_parallel_size = 1, please set moe_expert_fusion to false"
+            ), "Checkpoint will fail to save when moe_expert_fusion is true and sharding_parallel_size = 1, please set moe_expert_fusion to false or sharding_parallel_size > 1"
 
         if self.hybrid_parallel_topo_order is None:
             self.hybrid_parallel_topo_order = "sharding_first"

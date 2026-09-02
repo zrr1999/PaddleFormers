@@ -16,6 +16,7 @@ from typing import Any, Dict
 
 from .DPODataset import IteratorDPODataset, MapDPODataset
 from .SFTDataset import IteratorSFTDataset, MapSFTDataset, TextSequence
+from .fixed_token import FixedTokenSFTDataset
 
 
 def create_dataset(**dataset_config: Dict[str, Any]):
@@ -36,7 +37,9 @@ def create_dataset(**dataset_config: Dict[str, Any]):
         else:
             train_dataset = IteratorDPODataset(**dataset_config)
     else:
-        if dataset_type == "map":
+        if dataset_type == "fixed_token":
+            train_dataset = FixedTokenSFTDataset(**dataset_config)
+        elif dataset_type == "map":
             train_dataset = MapSFTDataset(**dataset_config)
         else:
             train_dataset = IteratorSFTDataset(**dataset_config)
